@@ -1,0 +1,7 @@
+[Unit]
+Description=Update native Craft Suite apps (storytold GitHub releases)
+Documentation=https://github.com/storytold
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/craft-sync

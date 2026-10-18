@@ -1,0 +1,189 @@
+#!/bin/bash
+# craft-sync - Native Craft Suite (storytold) manager for Omarchy.
+#
+# Installs/updates the Craft apps from their official GitHub releases
+# (github.com/storytold) as native bundles: binaries under
+# ~/.local/share/craft-suite/, symlinks in ~/.local/bin, desktop entries and
+# hicolor icons installed per app. Runs manually or from the daily
+# craft-sync.timer systemd user timer.
+#
+# Usage:
+#   craft-sync              Install/update every managed app
+#   craft-sync <app>...     Install/update specific app(s)
+#   craft-sync check        Show installed vs latest versions (no changes)
+#   craft-sync list         List managed apps and installed versions
+set -uo pipefail
+
+PREFIX="$HOME/.local"
+ROOT="$PREFIX/share/craft-suite"
+APPS_DIR="$ROOT/apps"
+STATE_DIR="$ROOT/state"
+BIN_DIR="$PREFIX/bin"
+TMP_DIR="$ROOT/tmp"
+GITHUB="https://api.github.com"
+ASSET_ARCH="x86_64"
+
+# repo (storytold/<repo>) -> release asset prefix. They differ for the
+# launcher: repo "craft-launcher" ships assets named "artcraft-launcher-*".
+declare -A REPOS=(
+  [craft-launcher]=artcraft-launcher
+  [photocraft]=photocraft
+  [filmcraft]=filmcraft
+  [pdfcraft]=pdfcraft
+  [wordcraft]=wordcraft
+  [deckcraft]=deckcraft
+  [gridcraft]=gridcraft
+  [lightcraft]=lightcraft
+  [vectorcraft]=vectorcraft
+  [designcraft]=designcraft
+  [effectcraft]=effectcraft
+  [cadcraft]=cadcraft
+  [soundcraft]=soundcraft
+  [figcraft]=figcraft
+)
+ORDER=(craft-launcher photocraft filmcraft pdfcraft wordcraft deckcraft
+       gridcraft lightcraft vectorcraft designcraft effectcraft cadcraft
+       soundcraft figcraft)
+
+mkdir -p "$APPS_DIR" "$STATE_DIR" "$BIN_DIR" "$TMP_DIR"
+
+installed_version() {
+  cat "$STATE_DIR/$1.version" 2>/dev/null
+}
+
+# latest_release <app> -> "<tag>|<asset_url>|<digest>"
+latest_release() {
+  local app=$1 prefix=${REPOS[$1]}
+  curl -fsSL "$GITHUB/repos/storytold/$app/releases/latest" |
+    jq -r --arg p "$prefix" --arg a "$ASSET_ARCH" '
+      . as $r
+      | ($r.assets | map(select(.name | test("^" + $p + "-[0-9][^-]*-linux-" + $a + "\\.tar\\.gz$"))) | first) as $m
+      | select($m != null)
+      | "\($r.tag_name)|\($m.browser_download_url)|\($m.digest // "")"'
+}
+
+install_app() {
+  local app=$1
+  local prefix=${REPOS[$app]:-}
+  if [[ -z $prefix ]]; then
+    echo "✗ $app: unknown app (not in craft-sync's managed list)"
+    return 1
+  fi
+
+  local release tag url digest
+  release=$(latest_release "$app") || { echo "✗ $app: GitHub API query failed"; return 1; }
+  if [[ -z $release ]]; then
+    echo "✗ $app: no linux-$ASSET_ARCH .tar.gz asset in latest release"
+    return 1
+  fi
+  IFS='|' read -r tag url digest <<<"$release"
+  tag=${tag#*v}
+  tag=${tag#$prefix-v}
+
+  local current
+  current=$(installed_version "$app")
+  if [[ $current == "$tag" ]]; then
+    echo "· $app: up to date (v$current)"
+    return 0
+  fi
+
+  local tarball="$TMP_DIR/$app-$tag.tar.gz"
+  echo "↓ $app: downloading v$tag ..."
+  curl -fsSL -o "$tarball" "$url" || { echo "✗ $app: download failed"; rm -f "$tarball"; return 1; }
+
+  if [[ -n $digest ]]; then
+    local want=${digest#sha256:}
+    local got
+    got=$(sha256sum "$tarball" | cut -d' ' -f1)
+    if [[ $want != "$got" ]]; then
+      echo "✗ $app: sha256 mismatch (want $want, got $got)"
+      rm -f "$tarball"
+      return 1
+    fi
+  fi
+
+  local dest="$APPS_DIR/$app-$tag"
+  rm -rf "$dest"
+  mkdir -p "$dest"
+  tar xzf "$tarball" --strip-components=1 -C "$dest" || { echo "✗ $app: extraction failed"; rm -rf "$dest" "$tarball"; return 1; }
+  rm -f "$tarball"
+
+  # Desktop entry: absolute Exec pointing at our stable symlink.
+  # Prefer the GUI binary (exact app name); fall back to the first shipped one.
+  local bin_name=$prefix
+  [[ -x $dest/bin/$bin_name ]] || bin_name=$(basename "$(find "$dest/bin" -maxdepth 1 -type f ! -name '*-cli' | head -1)")
+  local desk
+  desk=$(find "$dest/share/applications" -name '*.desktop' | head -1)
+  if [[ -n $desk ]]; then
+    sed -E "s|^Exec=[^ ]+|Exec=$BIN_DIR/$bin_name|; s|^TryExec=[^ ]+|TryExec=$BIN_DIR/$bin_name|" "$desk" \
+      > "$PREFIX/share/applications/$(basename "$desk")"
+  fi
+
+  # Icons + metainfo into the user hicolor/share trees.
+  [[ -d $dest/share/icons ]] && cp -rn "$dest/share/icons/"* "$PREFIX/share/icons/" 2>/dev/null
+  [[ -d $dest/share/metainfo ]] && mkdir -p "$PREFIX/share/metainfo" && cp -rn "$dest/share/metainfo/"* "$PREFIX/share/metainfo/" 2>/dev/null
+
+  # Swap the stable dir symlink and the ~/.local/bin symlink atomically.
+  ln -sfn "$dest" "$APPS_DIR/$app.tmp" && mv -T "$APPS_DIR/$app.tmp" "$APPS_DIR/$app"
+  ln -sfn "$APPS_DIR/$app/bin/$bin_name" "$BIN_DIR/$bin_name"
+
+  echo "$tag" > "$STATE_DIR/$app.version"
+
+  # Prune old versioned dirs (anything not the current target).
+  find "$APPS_DIR" -maxdepth 1 -name "$app-[0-9]*" -type d | while read -r d; do
+    [[ $d == "$dest" ]] || rm -rf "$d"
+  done
+
+  if [[ -n $current ]]; then
+    echo "↑ $app: updated v$current → v$tag"
+  else
+    echo "✔ $app: installed v$tag"
+  fi
+}
+
+check_all() {
+  for app in "${ORDER[@]}"; do
+    local release tag
+    release=$(latest_release "$app" 2>/dev/null) || { printf '%-16s %s\n' "$app" "— (query failed)"; continue; }
+    IFS='|' read -r tag _ <<<"$release"
+    tag=${tag#*v}; tag=${tag#${REPOS[$app]}-v}
+    local current
+    current=$(installed_version "$app")
+    local status="v${current:-not installed}"
+    [[ $current == "$tag" ]] || status+=" → v$tag AVAILABLE"
+    printf '%-16s %s\n' "$app" "$status"
+  done
+}
+
+list_apps() {
+  for app in "${ORDER[@]}"; do
+    printf '%-16s v%s\n' "$app" "$(installed_version "$app" || echo "not installed")"
+  done
+}
+
+case "${1:-}" in
+  check)
+    check_all
+    ;;
+  list)
+    list_apps
+    ;;
+  "")
+    fails=0
+    for app in "${ORDER[@]}"; do
+      install_app "$app" || fails=$((fails + 1))
+    done
+    gtk-update-icon-cache -f "$PREFIX/share/icons/hicolor" >/dev/null 2>&1 || true
+    update-desktop-database "$PREFIX/share/applications" >/dev/null 2>&1 || true
+    exit $fails
+    ;;
+  *)
+    fails=0
+    for app in "$@"; do
+      install_app "$app" || fails=$((fails + 1))
+    done
+    gtk-update-icon-cache -f "$PREFIX/share/icons/hicolor" >/dev/null 2>&1 || true
+    update-desktop-database "$PREFIX/share/applications" >/dev/null 2>&1 || true
+    exit $fails
+    ;;
+esac
